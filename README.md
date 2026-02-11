@@ -1,4 +1,7 @@
-<div align="center">
+<p align="center">
+  <img src="./Catalyst.png" alt="banner" style="border-radius:16px;" />
+
+</p><div align="center">
 
 # 🚀 Catalyst Kernel
 
