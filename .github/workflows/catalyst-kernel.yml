@@ -37,7 +37,7 @@ jobs:
       KBUILD_BUILD_USER: Chronix
       KBUILD_BUILD_HOST: github-actions
       
-      KERNEL_REPO: https://github.com/Violet-stuff/kernel_xiaomi_violet.git
+      KERNEL_REPO: https://github.com/chronix-cave/kernel_xiaomi_violet.git
       DEFAULT_BRANCH: 16
       ANYKERNEL_REPO: https://github.com/ChroniX-AOSP/AnyKernel33.git
       CLANG_REPO: https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r547379.git
@@ -119,41 +119,93 @@ jobs:
             HOSTCC=clang \
             HOSTLD=ld.lld
 
+          END=$(date +%s)
+          DURATION=$((END - START))
+          MIN=$((DURATION / 60))
+          SEC=$((DURATION % 60))
+          echo "duration=${MIN}m ${SEC}s" >> $GITHUB_OUTPUT
+
       - name: Verify Image.gz
         run: test -f kernel/out/arch/arm64/boot/Image.gz
 
       - name: Package Zip
         id: package
         run: |
+           test -f kernel/out/arch/arm64/boot/Image.gz
           VERSION="${{ steps.mode.outputs.version }}"
           ZIP_NAME="${KERNEL_NAME}-${VERSION}.zip"
 
           cp kernel/out/arch/arm64/boot/Image.gz AnyKernel3/
-          [ -f kernel/out/arch/arm64/boot/dtbo.img ] && cp kernel/out/arch/arm64/boot/dtbo.img AnyKernel3/
-          [ -f kernel/out/arch/arm64/boot/dtb.img ] && cp kernel/out/arch/arm64/boot/dtb.img AnyKernel3/
-
           cd AnyKernel3
-          zip -r9 "$ZIP_NAME" ./* \
-            -x ".git/*" "README.md" "*.zip" ".github/*" ".gitignore"
+          zip -r9 "$ZIP_NAME" ./* -x ".git/*"
+
+          SHA256=$(sha256sum "$ZIP_NAME" | awk '{print $1}')
+          echo "$SHA256  $ZIP_NAME" > "$ZIP_NAME.sha256"
 
           echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.package.outputs.zip_name }}
-          path: AnyKernel3/${{ steps.package.outputs.zip_name }}
-
-      - name: Create GitHub Release
-        if: |
-          steps.mode.outputs.is_tag == 'true' ||
-          github.event.inputs.create_release == 'true'
+     - name: Create Release
+        id: release
+        if: success() && (steps.mode.outputs.is_tag == 'true' || github.event.inputs.create_release == 'true')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.mode.outputs.version }}
-          name: Catalyst Kernel ${{ steps.mode.outputs.version }}
-          generate_release_notes: true
-          files: AnyKernel3/${{ steps.package.outputs.zip_name }}
+          name: "🚀 Catalyst Kernel ${{ steps.mode.outputs.version }}"
+          prerelease: ${{ steps.mode.outputs.prerelease }}
+          body: |
+            <div align="center">
+
+            ![Status](https://img.shields.io/badge/${{ steps.mode.outputs.release_type }}-Release-blue)
+            ![Build](https://img.shields.io/badge/Build-Passing-brightgreen)
+            ![LLVM](https://img.shields.io/badge/Toolchain-LLVM-orange)
+            ![ccache](https://img.shields.io/badge/ccache-${{ steps.build.outputs.ccache_hit }}25-success)
+
+            </div>
+
+            ---
+
+            ## 📦 Build Information
+
+            | Property | Value |
+            |-----------|--------|
+            | Version | `${{ steps.mode.outputs.version }}` |
+            | Branch | `${{ steps.mode.outputs.branch }}` |
+            | Commit | `${{ steps.kernel_meta.outputs.commit_hash }}` |
+            | Build Time | `${{ steps.build.outputs.duration }}` |
+
+            ---
+
+            ## 🛠 Toolchain
+            ```
+            ${{ steps.clang.outputs.clang_version }}
+            ```
+
+            ---
+
+            <details>
+            <summary><strong>🔄 Recent Changes</strong></summary>
+
+            ${{ steps.kernel_meta.outputs.changelog }}
+
+            </details>
+
+            ---
+
+            ## 🔐 Integrity
+
+            ```
+            SHA256: ${{ steps.package.outputs.sha256 }}
+            ```
+
+            Verify:
+            ```
+            sha256sum -c *.sha256
+            ```
+
+          files: |
+            AnyKernel3/${{ steps.package.outputs.zip_name }}
+            AnyKernel3/${{ steps.package.outputs.zip_name }}.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
