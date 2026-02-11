@@ -5,13 +5,21 @@ on:
     tags:
       - "v*"
       - "R*"
-      - "*-release"
   workflow_dispatch:
     inputs:
       kernel_branch:
         description: "Kernel branch to build"
         required: true
         default: "16"
+      build_variant:
+        description: "Select Build Variant"
+        required: true
+        default: "Standard"
+        type: choice
+        options:
+          - "Standard"
+          - "KSU"
+          - "KSU-nxt"
       create_release:
         description: "Create GitHub Release"
         required: true
@@ -36,118 +44,135 @@ jobs:
       KBUILD_BUILD_USER: Chronix
       KBUILD_BUILD_HOST: github-actions
       KERNEL_REPO: https://github.com/chronix-cave/kernel_xiaomi_violet.git
-      DEFAULT_BRANCH: 16
       ANYKERNEL_REPO: https://github.com/ChroniX-AOSP/AnyKernel33.git
       CLANG_REPO: https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r547379.git
       KERNEL_NAME: Catalyst-r1-violet
 
     steps:
-      - name: Determine build mode
+      - name: Determine Versioning
         id: mode
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             VERSION="${GITHUB_REF#refs/tags/}"
             echo "is_tag=true" >> $GITHUB_OUTPUT
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
-            echo "branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+            echo "branch=16" >> $GITHUB_OUTPUT
           else
-            VERSION="manual-$(date +%Y%m%d-%H%M)"
+            VARIANT="${{ github.event.inputs.build_variant }}"
+            VERSION="${{ github.event.inputs.kernel_branch }}-${VARIANT}-$(date +%Y%m%d-%H%M)"
             echo "is_tag=false" >> $GITHUB_OUTPUT
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
             echo "branch=${{ github.event.inputs.kernel_branch }}" >> $GITHUB_OUTPUT
           fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
           sudo apt update
           sudo apt install -y git zip bc bison flex libssl-dev libelf-dev ccache build-essential gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-      - name: Clone Toolchain & Source
+      - name: Clone Components
         run: |
           git clone --depth=1 -b "${{ steps.mode.outputs.branch }}" "$KERNEL_REPO" kernel
           git clone --depth=1 "$ANYKERNEL_REPO" AnyKernel3
           git clone --depth=1 "$CLANG_REPO" clang
-          
-      - name: Get Toolchain Info
-        id: clang_info
-        run: |
-          echo "version=$(clang/bin/clang --version | head -n 1)" >> $GITHUB_OUTPUT
 
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: .ccache
-          key: ${{ runner.os }}-ccache-${{ steps.mode.outputs.branch }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-ccache-${{ steps.mode.outputs.branch }}
-            ${{ runner.os }}-ccache-
-
-      - name: Setup environment
+      - name: Setup Toolchain & Cache
+        id: setup
         run: |
           echo "$GITHUB_WORKSPACE/clang/bin" >> $GITHUB_PATH
           echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache" >> $GITHUB_ENV
           echo "CCACHE_MAXSIZE=5G" >> $GITHUB_ENV
+          echo "clang_ver=$(clang/bin/clang --version | head -n 1)" >> $GITHUB_OUTPUT
+
+      - name: Restore Cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-ccache-${{ steps.mode.outputs.branch }}-${{ github.sha }}
+          restore-keys: ${{ runner.os }}-ccache-${{ steps.mode.outputs.branch }}
+
+      - name: Generate Metadata
+        id: meta
+        run: |
+          cd kernel
+          echo "commit=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          if [ -z "$PREV_TAG" ]; then
+            git log --oneline -n 10 --no-merges --pretty=format:"• %s" >> $GITHUB_OUTPUT
+          else
+            git log ${PREV_TAG}..HEAD --oneline --no-merges --pretty=format:"• %s" >> $GITHUB_OUTPUT
+          fi
+          echo -e "\nEOF" >> $GITHUB_OUTPUT
 
       - name: Build Kernel
-        id: build_kernel
+        id: build
         run: |
-          START=$(date +%s)
           cd kernel
+          START=$(date +%s)
           ccache -z
           make O=out ARCH=arm64 $DEFCONFIG
+          make -j$(nproc --all) O=out ARCH=arm64 CC="ccache clang" \
+               CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+               LLVM=1 LLVM_IAS=1 HOSTCC=clang HOSTLD=ld.lld
           
-          THREADS=$(nproc --all)
-          make -j"$THREADS" O=out \
-            ARCH=arm64 \
-            CC="ccache clang" \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            LLVM=1 LLVM_IAS=1 \
-            HOSTCC=clang \
-            HOSTLD=ld.lld
-
           END=$(date +%s)
-          DURATION=$((END - START))
-          echo "duration=$((DURATION / 60))m $((DURATION % 60))s" >> $GITHUB_OUTPUT
-          echo "commit_hash=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          DIFF=$((END - START))
+          echo "duration=$((DIFF / 60))m $((DIFF % 60))s" >> $GITHUB_OUTPUT
 
-      - name: Package Zip
+      - name: Package & Sign
         id: package
         run: |
-          VERSION="${{ steps.mode.outputs.version }}"
-          ZIP_NAME="${{ env.KERNEL_NAME }}-${VERSION}.zip"
+          ZIP_NAME="${{ env.KERNEL_NAME }}-${{ steps.mode.outputs.version }}.zip"
           cp kernel/out/arch/arm64/boot/Image.gz AnyKernel3/
           cd AnyKernel3
           zip -r9 "$ZIP_NAME" ./* -x ".git/*"
-          SHA256=$(sha256sum "$ZIP_NAME" | awk '{print $1}')
-          echo "$SHA256" > "$ZIP_NAME.sha256"
+          SHA=$(sha256sum "$ZIP_NAME" | awk '{print $1}')
+          echo "$SHA" > "$ZIP_NAME.sha256"
           echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
-          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "size=$(du -sh $ZIP_NAME | cut -f1)" >> $GITHUB_OUTPUT
 
-      - name: Create Release
+      - name: Push Release
         if: success() && (steps.mode.outputs.is_tag == 'true' || github.event.inputs.create_release == 'true')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.mode.outputs.version }}
-          name: "🚀 Catalyst Kernel ${{ steps.mode.outputs.version }}"
+          name: "🚀 Catalyst ${{ steps.mode.outputs.version }}"
           body: |
-            ## 📦 Build Information
-            | Property | Value |
-            |-----------|--------|
-            | **Version** | `${{ steps.mode.outputs.version }}` |
-            | **Branch** | `${{ steps.mode.outputs.branch }}` |
-            | **Commit** | `${{ steps.build_kernel.outputs.commit_hash }}` |
-            | **Build Time** | `${{ steps.build_kernel.outputs.duration }}` |
-
-            ## 🛠 Toolchain
-            ```
-            ${{ steps.clang_info.outputs.version }}
-            ```
-
-            ## 🔐 Integrity
-            `SHA256: ${{ steps.package.outputs.sha256 }}`
+            ### 📦 Build Info
+            - **Commit:** `${{ steps.meta.outputs.commit }}`
+            - **Toolchain:** `${{ steps.setup.outputs.clang_ver }}`
+            - **SHA256:** `${{ steps.package.outputs.sha }}`
           files: |
             AnyKernel3/${{ steps.package.outputs.zip_name }}
             AnyKernel3/*.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Send to Telegram
+        if: success()
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          format: html
+          document: |
+            AnyKernel3/${{ steps.package.outputs.zip_name }}
+            AnyKernel3/${{ steps.package.outputs.zip_name }}.sha256
+          message: |
+            <b>🚀 Catalyst Kernel Release</b>
+            ───────────────────────
+            <b>📱 Device:</b> <code>Xiaomi Violet</code>
+            <b>🧬 Variant:</b> <code>${{ github.event.inputs.build_variant || 'Push' }}</code>
+            <b>🏷 Version:</b> <code>${{ steps.mode.outputs.version }}</code>
+            <b>📦 Size:</b> <code>${{ steps.package.outputs.size }}</code>
+            <b>🕒 Duration:</b> <code>${{ steps.build.outputs.duration }}</code>
+            ───────────────────────
+            <b>📝 Changelog:</b>
+            ${{ steps.meta.outputs.changelog }}
+            ───────────────────────
+            <b>🔗 Links:</b>
+            • <a href="https://github.com/${{ github.repository }}/releases/tag/${{ steps.mode.outputs.version }}">GitHub Release</a>
+            
+            <b>🛡 SHA256:</b>
+            <code>${{ steps.package.outputs.sha }}</code>
