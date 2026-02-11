@@ -1,0 +1,161 @@
+name: Catalyst Kernel Release
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "R*"
+      - "*-release"
+
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: "Kernel branch to build"
+        required: true
+        default: "main"
+      create_release:
+        description: "Create GitHub Release"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      DEFCONFIG: vendor/violet-perf_defconfig
+      KBUILD_BUILD_USER: Chronix
+      KBUILD_BUILD_HOST: github-actions
+      
+      KERNEL_REPO: https://github.com/Violet-stuff/kernel_xiaomi_violet.git
+      DEFAULT_BRANCH: 16
+      ANYKERNEL_REPO: https://github.com/ChroniX-AOSP/AnyKernel33.git
+      CLANG_REPO: https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r547379.git
+
+      KERNEL_NAME: Catalyst-r1-violet
+
+    steps:
+      - name: Determine build mode
+        id: mode
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            echo "is_tag=true" >> $GITHUB_OUTPUT
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+          else
+            VERSION="manual-$(date +%Y%m%d-%H%M)"
+            echo "is_tag=false" >> $GITHUB_OUTPUT
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "branch=${{ github.event.inputs.kernel_branch }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            git zip bc bison flex \
+            libssl-dev libelf-dev \
+            ccache build-essential \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi
+
+      - name: Clone Kernel Source
+        run: |
+          git clone --depth=1 -b "${{ steps.mode.outputs.branch }}" "$KERNEL_REPO" kernel
+
+      - name: Clone AnyKernel3
+        run: git clone --depth=1 "$ANYKERNEL_REPO" AnyKernel3
+
+      - name: Clone Clang
+        run: git clone --depth=1 "$CLANG_REPO" clang
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: kernel/.ccache
+          key: ${{ runner.os }}-ccache-${{ steps.mode.outputs.branch }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-
+
+      - name: Setup environment
+        run: |
+          echo "PATH=$GITHUB_WORKSPACE/clang/bin:$PATH" >> $GITHUB_ENV
+          echo "CCACHE_DIR=$GITHUB_WORKSPACE/kernel/.ccache" >> $GITHUB_ENV
+          echo "CCACHE_MAXSIZE=25G" >> $GITHUB_ENV
+
+      - name: Zero ccache
+        run: |
+          ccache -z
+          ccache -M 25G
+
+      - name: Generate defconfig
+        run: |
+          cd kernel
+          make O=out ARCH=arm64 $DEFCONFIG
+
+      - name: Build Kernel
+        run: |
+          cd kernel
+          THREADS=$(($(nproc --all) * 2))
+
+          make -j"$THREADS" O=out \
+            ARCH=arm64 \
+            CC="ccache clang" \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            LD=ld.lld \
+            LLVM=1 LLVM_IAS=1 \
+            HOSTCC=clang \
+            HOSTLD=ld.lld
+
+      - name: Verify Image.gz
+        run: test -f kernel/out/arch/arm64/boot/Image.gz
+
+      - name: Package Zip
+        id: package
+        run: |
+          VERSION="${{ steps.mode.outputs.version }}"
+          ZIP_NAME="${KERNEL_NAME}-${VERSION}.zip"
+
+          cp kernel/out/arch/arm64/boot/Image.gz AnyKernel3/
+          [ -f kernel/out/arch/arm64/boot/dtbo.img ] && cp kernel/out/arch/arm64/boot/dtbo.img AnyKernel3/
+          [ -f kernel/out/arch/arm64/boot/dtb.img ] && cp kernel/out/arch/arm64/boot/dtb.img AnyKernel3/
+
+          cd AnyKernel3
+          zip -r9 "$ZIP_NAME" ./* \
+            -x ".git/*" "README.md" "*.zip" ".github/*" ".gitignore"
+
+          echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.zip_name }}
+          path: AnyKernel3/${{ steps.package.outputs.zip_name }}
+
+      - name: Create GitHub Release
+        if: |
+          steps.mode.outputs.is_tag == 'true' ||
+          github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.mode.outputs.version }}
+          name: Catalyst Kernel ${{ steps.mode.outputs.version }}
+          generate_release_notes: true
+          files: AnyKernel3/${{ steps.package.outputs.zip_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show ccache stats
+        run: ccache -s
