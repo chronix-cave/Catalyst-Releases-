@@ -6,13 +6,12 @@ on:
       - "v*"
       - "R*"
       - "*-release"
-
   workflow_dispatch:
     inputs:
       kernel_branch:
         description: "Kernel branch to build"
         required: true
-        default: "main"
+        default: "16"
       create_release:
         description: "Create GitHub Release"
         required: true
@@ -36,12 +35,10 @@ jobs:
       DEFCONFIG: vendor/violet-perf_defconfig
       KBUILD_BUILD_USER: Chronix
       KBUILD_BUILD_HOST: github-actions
-      
       KERNEL_REPO: https://github.com/chronix-cave/kernel_xiaomi_violet.git
       DEFAULT_BRANCH: 16
       ANYKERNEL_REPO: https://github.com/ChroniX-AOSP/AnyKernel33.git
       CLANG_REPO: https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r547379.git
-
       KERNEL_NAME: Catalyst-r1-violet
 
     steps:
@@ -63,151 +60,94 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y \
-            git zip bc bison flex \
-            libssl-dev libelf-dev \
-            ccache build-essential \
-            gcc-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi
+          sudo apt install -y git zip bc bison flex libssl-dev libelf-dev ccache build-essential gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-      - name: Clone Kernel Source
+      - name: Clone Toolchain & Source
         run: |
           git clone --depth=1 -b "${{ steps.mode.outputs.branch }}" "$KERNEL_REPO" kernel
-
-      - name: Clone AnyKernel3
-        run: git clone --depth=1 "$ANYKERNEL_REPO" AnyKernel3
-
-      - name: Clone Clang
-        run: git clone --depth=1 "$CLANG_REPO" clang
+          git clone --depth=1 "$ANYKERNEL_REPO" AnyKernel3
+          git clone --depth=1 "$CLANG_REPO" clang
+          
+      - name: Get Toolchain Info
+        id: clang_info
+        run: |
+          echo "version=$(clang/bin/clang --version | head -n 1)" >> $GITHUB_OUTPUT
 
       - name: Restore ccache
         uses: actions/cache@v4
         with:
-          path: kernel/.ccache
-          key: ${{ runner.os }}-ccache-${{ steps.mode.outputs.branch }}
+          path: .ccache
+          key: ${{ runner.os }}-ccache-${{ steps.mode.outputs.branch }}-${{ github.sha }}
           restore-keys: |
+            ${{ runner.os }}-ccache-${{ steps.mode.outputs.branch }}
             ${{ runner.os }}-ccache-
 
       - name: Setup environment
         run: |
-          echo "PATH=$GITHUB_WORKSPACE/clang/bin:$PATH" >> $GITHUB_ENV
-          echo "CCACHE_DIR=$GITHUB_WORKSPACE/kernel/.ccache" >> $GITHUB_ENV
-          echo "CCACHE_MAXSIZE=25G" >> $GITHUB_ENV
-
-      - name: Zero ccache
-        run: |
-          ccache -z
-          ccache -M 25G
-
-      - name: Generate defconfig
-        run: |
-          cd kernel
-          make O=out ARCH=arm64 $DEFCONFIG
+          echo "$GITHUB_WORKSPACE/clang/bin" >> $GITHUB_PATH
+          echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache" >> $GITHUB_ENV
+          echo "CCACHE_MAXSIZE=5G" >> $GITHUB_ENV
 
       - name: Build Kernel
+        id: build_kernel
         run: |
+          START=$(date +%s)
           cd kernel
-          THREADS=$(($(nproc --all) * 2))
-
+          ccache -z
+          make O=out ARCH=arm64 $DEFCONFIG
+          
+          THREADS=$(nproc --all)
           make -j"$THREADS" O=out \
             ARCH=arm64 \
             CC="ccache clang" \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            LD=ld.lld \
             LLVM=1 LLVM_IAS=1 \
             HOSTCC=clang \
             HOSTLD=ld.lld
 
           END=$(date +%s)
           DURATION=$((END - START))
-          MIN=$((DURATION / 60))
-          SEC=$((DURATION % 60))
-          echo "duration=${MIN}m ${SEC}s" >> $GITHUB_OUTPUT
-
-      - name: Verify Image.gz
-        run: test -f kernel/out/arch/arm64/boot/Image.gz
+          echo "duration=$((DURATION / 60))m $((DURATION % 60))s" >> $GITHUB_OUTPUT
+          echo "commit_hash=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
       - name: Package Zip
         id: package
         run: |
-           test -f kernel/out/arch/arm64/boot/Image.gz
           VERSION="${{ steps.mode.outputs.version }}"
-          ZIP_NAME="${KERNEL_NAME}-${VERSION}.zip"
-
+          ZIP_NAME="${{ env.KERNEL_NAME }}-${VERSION}.zip"
           cp kernel/out/arch/arm64/boot/Image.gz AnyKernel3/
           cd AnyKernel3
           zip -r9 "$ZIP_NAME" ./* -x ".git/*"
-
           SHA256=$(sha256sum "$ZIP_NAME" | awk '{print $1}')
-          echo "$SHA256  $ZIP_NAME" > "$ZIP_NAME.sha256"
-
+          echo "$SHA256" > "$ZIP_NAME.sha256"
           echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
           echo "sha256=$SHA256" >> $GITHUB_OUTPUT
 
-     - name: Create Release
-        id: release
+      - name: Create Release
         if: success() && (steps.mode.outputs.is_tag == 'true' || github.event.inputs.create_release == 'true')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.mode.outputs.version }}
           name: "🚀 Catalyst Kernel ${{ steps.mode.outputs.version }}"
-          prerelease: ${{ steps.mode.outputs.prerelease }}
           body: |
-            <div align="center">
-
-            ![Status](https://img.shields.io/badge/${{ steps.mode.outputs.release_type }}-Release-blue)
-            ![Build](https://img.shields.io/badge/Build-Passing-brightgreen)
-            ![LLVM](https://img.shields.io/badge/Toolchain-LLVM-orange)
-            ![ccache](https://img.shields.io/badge/ccache-${{ steps.build.outputs.ccache_hit }}25-success)
-
-            </div>
-
-            ---
-
             ## 📦 Build Information
-
             | Property | Value |
             |-----------|--------|
-            | Version | `${{ steps.mode.outputs.version }}` |
-            | Branch | `${{ steps.mode.outputs.branch }}` |
-            | Commit | `${{ steps.kernel_meta.outputs.commit_hash }}` |
-            | Build Time | `${{ steps.build.outputs.duration }}` |
-
-            ---
+            | **Version** | `${{ steps.mode.outputs.version }}` |
+            | **Branch** | `${{ steps.mode.outputs.branch }}` |
+            | **Commit** | `${{ steps.build_kernel.outputs.commit_hash }}` |
+            | **Build Time** | `${{ steps.build_kernel.outputs.duration }}` |
 
             ## 🛠 Toolchain
             ```
-            ${{ steps.clang.outputs.clang_version }}
+            ${{ steps.clang_info.outputs.version }}
             ```
-
-            ---
-
-            <details>
-            <summary><strong>🔄 Recent Changes</strong></summary>
-
-            ${{ steps.kernel_meta.outputs.changelog }}
-
-            </details>
-
-            ---
 
             ## 🔐 Integrity
-
-            ```
-            SHA256: ${{ steps.package.outputs.sha256 }}
-            ```
-
-            Verify:
-            ```
-            sha256sum -c *.sha256
-            ```
-
+            `SHA256: ${{ steps.package.outputs.sha256 }}`
           files: |
             AnyKernel3/${{ steps.package.outputs.zip_name }}
-            AnyKernel3/${{ steps.package.outputs.zip_name }}.sha256
+            AnyKernel3/*.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Show ccache stats
-        run: ccache -s
